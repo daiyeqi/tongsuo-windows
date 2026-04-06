@@ -1,0 +1,213 @@
+name: build-tongsuo-windows
+
+on:
+  release:
+    types: [published]
+
+env:
+  TONGSUO_VERSION: 8.5.0-pre1
+  TONGSUO_SRC_ROOT: ${{ github.workspace }}/src
+  TONGSUO_INSTALL_ROOT: ${{ github.workspace }}/install
+  TONGSUO_DIST_ROOT: ${{ github.workspace }}/dist
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-2025-vs2026
+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: windows-amd64
+            vcpkg_triplet: x64-windows-static-md
+            vs_arch: amd64
+            configure_target: VC-WIN64A
+
+          - arch: arm64
+            target: windows-arm64
+            vcpkg_triplet: arm64-windows-static-md
+            vs_arch: arm64
+            configure_target: VC-WIN64-CLANGASM-ARM
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Install NASM zlib zstd brotli
+        run: |
+          choco install nasm -y --no-progress --limit-output
+          vcpkg install zlib zstd brotli --triplet=${{ matrix.vcpkg_triplet }}
+
+      - name: Download and extract source
+        run: |
+          New-Item -ItemType Directory -Path ${env:TONGSUO_SRC_ROOT} -Force | Out-Null
+          $zipFile = Join-Path "${env:TONGSUO_SRC_ROOT}" "tongsuo-${env:TONGSUO_VERSION}.zip"
+          aria2c --quiet `
+            -d "${env:TONGSUO_SRC_ROOT}" `
+            -o "tongsuo-${env:TONGSUO_VERSION}.zip" `
+            "https://github.com/Tongsuo-Project/Tongsuo/archive/refs/tags/${env:TONGSUO_VERSION}.zip"
+          7z x "$zipFile" "-o${env:TONGSUO_SRC_ROOT}" -y
+
+      - name: Build and install
+        run: |
+          $srcDir = Join-Path ${env:TONGSUO_SRC_ROOT} "Tongsuo-${env:TONGSUO_VERSION}"
+          $installDir = Join-Path ${env:TONGSUO_INSTALL_ROOT} "tongsuo-${env:TONGSUO_VERSION}"
+
+          $vsInstallPath = vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vsDevShell = Join-Path $vsInstallPath 'Common7\Tools\Launch-VsDevShell.ps1'
+          & $vsDevShell -Arch ${{ matrix.vs_arch }} -HostArch amd64 -SkipAutomaticLocation
+
+          $tripletPath = Join-Path ${env:VCPKG_INSTALLATION_ROOT} "installed\${{ matrix.vcpkg_triplet }}"
+
+          Set-Location $srcDir
+
+          perl Configure ${{ matrix.configure_target }} shared `
+              no-capieng `
+              no-makedepend `
+              enable-ntls `
+              enable-ec_elgamal `
+              enable-paillier `
+              enable-twisted_ec_elgamal `
+              enable-zlib `
+              enable-zstd `
+              enable-brotli `
+              --with-zlib-include=$tripletPath\include `
+              --with-zlib-lib=$tripletPath\lib\zlib.lib `
+              --with-zstd-include=$tripletPath\include `
+              --with-zstd-lib=$tripletPath\lib\zstd.lib `
+              --with-brotli-include=$tripletPath\include `
+              --with-brotli-lib=$tripletPath\lib `
+              --prefix="$installDir" `
+              --openssldir="$installDir\ssl"
+
+          nmake /S
+          nmake /S install_sw
+
+      - name: Write BUILD-INFO.txt
+        run: |
+          $installDir = Join-Path ${env:TONGSUO_INSTALL_ROOT} "tongsuo-${env:TONGSUO_VERSION}"
+
+          $vsInstallPath = vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vsDevShell = Join-Path $vsInstallPath 'Common7\Tools\Launch-VsDevShell.ps1'
+          & $vsDevShell -Arch ${{ matrix.vs_arch }} -HostArch amd64 -SkipAutomaticLocation
+
+          function Get-FirstNonEmptyLine([object[]]$Lines) {
+            foreach ($line in $Lines) {
+              $text = "$line".Trim()
+              if ($text) { return $text }
+            }
+            return $null
+          }
+
+          $vsVersion = "N/A"
+          $windowsVersion = "N/A"
+          $msvcToolset = $env:VCToolsVersion
+          $nasmVersion = "N/A"
+          $sevenZipVersion = "N/A"
+          $perlVersion = "N/A"
+          $clVersion = "N/A"
+          $chocoVersion = "N/A"
+          $vcpkgVersion = "N/A"
+          $zlibVersion = "N/A"
+          $zstdVersion = "N/A"
+          $brotliVersion = "N/A"
+
+          $vsVersion = Get-FirstNonEmptyLine (vswhere -latest -products * -property installationVersion 2>$null)
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $windowsVersion = "$($cv.ProductName) (Build $($cv.CurrentBuild).$($cv.UBR))"
+          if ((Get-FirstNonEmptyLine (nasm -v 2>&1)) -match 'NASM version\s+([^\s]+)') { $nasmVersion = $matches[1].Trim() }
+          if ((Get-FirstNonEmptyLine (7z 2>&1)) -match '^7-Zip\s+(.+?)\s*:') { $sevenZipVersion = $matches[1].Trim() }
+          if ((Get-FirstNonEmptyLine (perl -v 2>&1)) -match '\((v[^)]+)\)\s+(built for .+)$') { $perlVersion = "$($matches[1]) $($matches[2])".Trim() }
+          if ((Get-FirstNonEmptyLine (cl 2>&1)) -match 'Version\s+(.+)$') { $clVersion = $matches[1].Trim() }
+          $chocoVersion = Get-FirstNonEmptyLine (choco -v 2>&1)
+          if ((Get-FirstNonEmptyLine (vcpkg version 2>&1)) -match 'version\s+(.+)$') { $vcpkgVersion = $matches[1].Trim() }
+          $vcpkgList = (vcpkg list 2>&1)
+          if ((Get-FirstNonEmptyLine ($vcpkgList | Select-String "^zlib:${{ matrix.vcpkg_triplet }}\s+" | Select-Object -First 1)) -match '^\S+\s+([^\s]+)') {
+            $zlibVersion = $matches[1].Trim()
+          }
+          if ((Get-FirstNonEmptyLine ($vcpkgList | Select-String "^zstd:${{ matrix.vcpkg_triplet }}\s+" | Select-Object -First 1)) -match '^\S+\s+([^\s]+)') {
+            $zstdVersion = $matches[1].Trim()
+          }
+          if ((Get-FirstNonEmptyLine ($vcpkgList | Select-String "^brotli:${{ matrix.vcpkg_triplet }}\s+" | Select-Object -First 1)) -match '^\S+\s+([^\s]+)') {
+            $brotliVersion = $matches[1].Trim()
+          }
+
+          $content = @"
+          ========================================
+          Tongsuo Build Information
+          ========================================
+
+          [Product]
+          Target            : ${{ matrix.target }}
+          Arch              : ${{ matrix.arch }}
+          Configure Target  : ${{ matrix.configure_target }}
+
+          [Build]
+          Built At (UTC)    : $(Get-Date -AsUTC -Format o)
+
+          [Toolchain]
+          Windows           : $windowsVersion
+          Visual Studio     : $vsVersion
+          MSVC Toolset      : $msvcToolset
+          CL                : $clVersion
+          Perl              : $perlVersion
+          NASM              : $nasmVersion
+          7-Zip             : $sevenZipVersion
+
+          [Package Managers]
+          Chocolatey        : $chocoVersion
+          Vcpkg             : $vcpkgVersion
+
+          [Dependencies]
+          zlib              : $zlibVersion
+          zstd              : $zstdVersion
+          brotli            : $brotliVersion
+          "@
+
+          $content | Set-Content -Path (Join-Path $installDir 'BUILD-INFO.txt') -Encoding UTF8
+
+      - name: Package zip
+        run: |
+          $artifactZip = Join-Path ${env:TONGSUO_DIST_ROOT} "tongsuo-${env:TONGSUO_VERSION}-${{ matrix.arch }}.zip"
+
+          New-Item -ItemType Directory -Path ${env:TONGSUO_DIST_ROOT} -Force | Out-Null
+          Set-Location ${env:TONGSUO_INSTALL_ROOT}
+
+          7z a -tzip "$artifactZip" "tongsuo-${env:TONGSUO_VERSION}" '-xr!*.pdb'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tongsuo-${{ env.TONGSUO_VERSION }}-${{ matrix.arch }}
+          path: ${{ env.TONGSUO_DIST_ROOT }}/tongsuo-${{ env.TONGSUO_VERSION }}-${{ matrix.arch }}.zip
+
+  publish-release:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download amd64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: tongsuo-${{ env.TONGSUO_VERSION }}-amd64
+          path: release-assets
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: tongsuo-${{ env.TONGSUO_VERSION }}-arm64
+          path: release-assets
+
+      - name: Upload assets to current Release
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "release-assets/tongsuo-${{ env.TONGSUO_VERSION }}-amd64.zip" \
+            "release-assets/tongsuo-${{ env.TONGSUO_VERSION }}-arm64.zip" \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
